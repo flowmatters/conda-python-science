@@ -7,7 +7,7 @@ RUN apt-get update && \
     /opt/conda/bin/conda install jupyter -y --quiet && \
     conda install --yes netcdf4 xarray && \
     cd /tmp && pip install -r requirements.txt && \
-    apt-get install cdo && \
+    apt-get install -y cdo && \
     mkdir /opt/notebooks 
     # conda install --yes -c conda-forge gdal && \
 
