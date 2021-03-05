@@ -1,4 +1,4 @@
-FROM continuumio/anaconda3:2020.02
+FROM continuumio/anaconda3:2020.11
 
 COPY requirements.txt /tmp/requirements.txt
 
