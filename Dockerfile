@@ -2,7 +2,11 @@ FROM continuumio/anaconda3:2020.11
 
 COPY requirements.txt /tmp/requirements.txt
 
-RUN apt-get update && \
+# The base image is Debian buster, which is end of life. Its packages are now
+# only on archive.debian.org.
+RUN sed -i -e 's|deb.debian.org|archive.debian.org|g' \
+           -e 's|security.debian.org|archive.debian.org|g' /etc/apt/sources.list && \
+    apt-get update && \
     apt-get install -y g++ libgdal-dev libgdal20 gdal-bin && \
     /opt/conda/bin/conda install jupyter -y --quiet && \
     conda install --yes netcdf4 xarray && \
