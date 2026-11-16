@@ -1,0 +1,240 @@
+# Build conda-python-science and push it to Azure Container Registry
+# (flowmatters.azurecr.io/conda-python-science). This replaces the Docker Hub build of
+# joelrahman/conda-python-science. It follows flowmatters/peper's image.yml: GitHub OIDC
+# logs in to a managed identity that has AcrPush only, so no secrets are stored.
+# See docs/ci-acr.md.
+name: acr conda-python-science
+
+on:
+  pull_request:
+    paths-ignore:
+      - "docs/ci-acr.md"
+  push:
+    branches: [master]
+    paths-ignore:
+      - ".github/**"
+      - "docs/ci-acr.md"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "check: build and diff against the current ACR image, no push. publish: build and push."
+        type: choice
+        options: [check, publish]
+        default: check
+      compare_tag:
+        description: "ACR tag to diff against in check mode"
+        type: string
+        default: latest
+
+permissions:
+  contents: read
+
+concurrency:
+  group: acr-conda-python-science-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  REGISTRY: flowmatters.azurecr.io
+  IMAGE: flowmatters.azurecr.io/conda-python-science
+  CONTEXT: .
+  DOCKERFILE: Dockerfile
+
+jobs:
+  # Pull requests: build only. No Azure login and no push.
+  build:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: ${{ env.CONTEXT }}
+          file: ${{ env.DOCKERFILE }}
+          push: false
+          tags: ${{ env.IMAGE }}:pr
+          cache-from: type=gha,scope=conda-python-science
+
+  # Dispatch with mode=check: build, then diff packages, files and config against
+  # the image already in ACR. Nothing is pushed.
+  check:
+    if: >-
+      github.event_name == 'workflow_dispatch' && inputs.mode == 'check' &&
+      github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      changed: ${{ steps.diff.outputs.changed }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # The check holds two copies of the image, and some (conda) images are several GB.
+      - name: Free disk space
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+      - uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906 # v3.1.0
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      # Not `az acr login`: that reads the registry through Resource Manager,
+      # which AcrPush (a data-plane role) does not allow. Exchange an Entra
+      # token for an ACR refresh token directly instead.
+      - name: Log in to ACR
+        run: |
+          aad=$(az account get-access-token --resource https://containerregistry.azure.net \
+                  --query accessToken -o tsv)
+          echo "::add-mask::$aad"
+          refresh=$(curl -fsS "https://$REGISTRY/oauth2/exchange" \
+                      --data-urlencode grant_type=access_token \
+                      --data-urlencode "service=$REGISTRY" \
+                      --data-urlencode "access_token=$aad" | jq -r .refresh_token)
+          if [ -z "$refresh" ] || [ "$refresh" = null ]; then
+            echo "::error::ACR token exchange returned no refresh token"; exit 1
+          fi
+          echo "::add-mask::$refresh"
+          docker login "$REGISTRY" --username 00000000-0000-0000-0000-000000000000 \
+            --password-stdin <<<"$refresh"
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: ${{ env.CONTEXT }}
+          file: ${{ env.DOCKERFILE }}
+          push: false
+          load: true
+          tags: ${{ env.IMAGE }}:check
+          cache-from: type=gha,scope=conda-python-science
+          cache-to: type=gha,mode=max,scope=conda-python-science
+      - id: diff
+        name: Diff against the current ACR image
+        env:
+          COMPARE_TAG: ${{ inputs.compare_tag }}
+        run: |
+          set -uo pipefail
+          new="$IMAGE:check"
+          old="$IMAGE:$COMPARE_TAG"
+          inv() {
+            docker run --rm --entrypoint sh "$1" -c '
+              if command -v conda >/dev/null 2>&1; then conda list --export 2>/dev/null | grep -v "^#" | sed "s/^/conda /"; fi
+              for p in pip pip3; do if command -v $p >/dev/null 2>&1; then $p freeze 2>/dev/null | sed "s/^/pip /"; break; fi; done
+              if command -v dpkg-query >/dev/null 2>&1; then dpkg-query -W -f="dpkg \${Package} \${Version}\n"; fi
+              if command -v apk >/dev/null 2>&1; then apk info -v 2>/dev/null | sed "s/^/apk /"; fi
+              if command -v gem >/dev/null 2>&1; then gem list 2>/dev/null | sed "s/^/gem /"; fi
+              true' | sort -u
+          }
+          files() {
+            wd=$(docker image inspect -f '{{.Config.WorkingDir}}' "$1")
+            if [ -z "$wd" ] || [ "$wd" = / ]; then echo "(no WORKDIR)"; return; fi
+            docker run --rm --entrypoint sh "$1" -c "cd '$wd' && find . -type f ! -path '*/node_modules/*' ! -path '*/__pycache__/*' ! -name '*.pyc' ! -path './.git/*' -exec md5sum {} + 2>/dev/null | sort -k2" \
+              | sed "s|^|$wd |"
+          }
+          conf() {
+            docker image inspect "$1" | jq -S '.[0].Config | {Cmd, Entrypoint, Env, ExposedPorts, User, WorkingDir, Volumes}'
+          }
+          mkdir -p diff
+          if ! docker pull -q "$old"; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "ACR-CHECK-RESULT image=conda-python-science changed=true reason=no-baseline:$COMPARE_TAG"
+            echo "### conda-python-science: no \`$COMPARE_TAG\` in ACR to compare with" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          for k in old new; do
+            img=$([ $k = old ] && echo "$old" || echo "$new")
+            inv "$img" > "diff/pkgs.$k"
+            files "$img" > "diff/files.$k"
+            conf "$img" > "diff/conf.$k"
+          done
+          diff -u diff/pkgs.old diff/pkgs.new > diff/pkgs.diff; p=$?
+          diff -u diff/files.old diff/files.new > diff/files.diff; f=$?
+          diff -u diff/conf.old diff/conf.new > diff/conf.diff; c=$?
+          np=$(grep -c '^[-+][^-+]' diff/pkgs.diff || true)
+          nf=$(grep -c '^[-+][^-+]' diff/files.diff || true)
+          nc=$(grep -c '^[-+][^-+]' diff/conf.diff || true)
+          changed=false; [ $((p + f + c)) -gt 0 ] && changed=true
+          echo "changed=$changed" >> "$GITHUB_OUTPUT"
+          echo "ACR-CHECK-RESULT image=conda-python-science changed=$changed pkg_lines=$np file_lines=$nf config_lines=$nc baseline=$COMPARE_TAG"
+          for d in conf pkgs files; do echo "::group::$d diff"; cat "diff/$d.diff"; echo "::endgroup::"; done
+          {
+            echo "### conda-python-science vs ACR \`$COMPARE_TAG\`: changed=$changed"
+            echo "Changed lines: packages $np, app files $nf, config $nc."
+            for d in conf pkgs files; do
+              echo "<details><summary>$d</summary>"; echo; echo '```diff'; head -n 400 "diff/$d.diff"; echo '```'; echo "</details>"
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # Push to master, or dispatch with mode=publish: build and push.
+  publish:
+    if: >-
+      github.ref == format('refs/heads/{0}', github.event.repository.default_branch) &&
+      (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.mode == 'publish'))
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ${{ env.IMAGE }}
+          flavor: latest=false
+          tags: |
+            type=sha,prefix=sha-,format=short
+            type=raw,value=latest,enable={{is_default_branch}}
+      - uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906 # v3.1.0
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      # Not `az acr login`: that reads the registry through Resource Manager,
+      # which AcrPush (a data-plane role) does not allow. Exchange an Entra
+      # token for an ACR refresh token directly instead.
+      - name: Log in to ACR
+        run: |
+          aad=$(az account get-access-token --resource https://containerregistry.azure.net \
+                  --query accessToken -o tsv)
+          echo "::add-mask::$aad"
+          refresh=$(curl -fsS "https://$REGISTRY/oauth2/exchange" \
+                      --data-urlencode grant_type=access_token \
+                      --data-urlencode "service=$REGISTRY" \
+                      --data-urlencode "access_token=$aad" | jq -r .refresh_token)
+          if [ -z "$refresh" ] || [ "$refresh" = null ]; then
+            echo "::error::ACR token exchange returned no refresh token"; exit 1
+          fi
+          echo "::add-mask::$refresh"
+          docker login "$REGISTRY" --username 00000000-0000-0000-0000-000000000000 \
+            --password-stdin <<<"$refresh"
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - id: build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: ${{ env.CONTEXT }}
+          file: ${{ env.DOCKERFILE }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          annotations: ${{ steps.meta.outputs.annotations }}
+          provenance: mode=min
+          cache-from: type=gha,scope=conda-python-science
+          cache-to: type=gha,mode=max,scope=conda-python-science
+      - name: Summary
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          {
+            echo "### Pushed"
+            echo '```'
+            echo "$TAGS"
+            echo "digest: $DIGEST"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
