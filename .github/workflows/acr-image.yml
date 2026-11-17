@@ -116,7 +116,7 @@ jobs:
         env:
           COMPARE_TAG: ${{ inputs.compare_tag }}
         run: |
-          set -uo pipefail
+          set +e -uo pipefail
           new="$IMAGE:check"
           old="$IMAGE:$COMPARE_TAG"
           inv() {
